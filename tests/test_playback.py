@@ -5,7 +5,14 @@ from unittest.mock import patch
 
 from yarl import URL
 
-from plexio.plex.playback import _position_ms, _timeline, proxy_playback
+from plexio.plex.playback import (
+    _keepalive_loop,
+    _position_ms,
+    _timeline,
+    direct_play_url,
+    proxy_playback,
+    start_keepalive,
+)
 
 
 class FakeContent:
@@ -74,6 +81,55 @@ class FakeClient:
     def head(self, url, **kwargs):
         self.calls.append(('HEAD', url, kwargs))
         return self.stream_response
+
+
+class KeepaliveResponse(FakeResponse):
+    def __init__(self, *, payload=None, status=200):
+        super().__init__(status=status)
+        self.payload = payload
+
+    async def json(self, content_type=None):
+        return self.payload
+
+
+def sessions_payload(rating_key='42', identifier='plexio-session-id'):
+    return {
+        'MediaContainer': {
+            'Metadata': [
+                {'ratingKey': rating_key, 'Client': {'identifier': identifier}},
+            ],
+        },
+    }
+
+
+class KeepaliveClient:
+    """Client that answers /status/sessions from a scripted list.
+
+    Once the script runs out the session is reported gone, so a test that
+    forgets to end the loop still terminates instead of hanging.
+    """
+
+    def __init__(self, session_payloads=(), *, sessions_status=200):
+        self.session_payloads = list(session_payloads)
+        self.sessions_status = sessions_status
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(('GET', url, kwargs))
+        if '/status/sessions' not in str(url):
+            return FakeResponse()
+        if self.sessions_status >= 400:
+            return KeepaliveResponse(status=self.sessions_status)
+        if self.session_payloads:
+            return KeepaliveResponse(payload=self.session_payloads.pop(0))
+        return KeepaliveResponse(payload=sessions_payload(identifier='someone-else'))
+
+    def timeline_states(self):
+        return [
+            url.query['state']
+            for _, url, _ in self.calls
+            if '/:/timeline' in str(url)
+        ]
 
 
 class PlaybackPositionTests(TestCase):
@@ -340,3 +396,105 @@ class PlaybackProxyTests(IsolatedAsyncioTestCase):
         self.assertEqual(response.headers['content-range'], 'bytes 0-999/1000')
         self.assertTrue(upstream.closed)
         self.assertEqual([method for method, _, _ in client.calls], ['HEAD'])
+
+
+class PlaybackKeepaliveTests(IsolatedAsyncioTestCase):
+    def _configuration(self):
+        return SimpleNamespace(
+            streaming_url=URL('http://192.168.50.194:32400'),
+            discovery_url=URL('https://plex.example.test'),
+            access_token='secret',
+        )
+
+    def _run_loop(self, client, duration_ms):
+        return _keepalive_loop(
+            client,
+            url=URL('https://plex.example.test'),
+            token='secret',
+            rating_key='42',
+            duration_ms=duration_ms,
+            identifier='session-id',
+        )
+
+    def test_direct_play_url_carries_this_install_as_the_client(self):
+        parsed = URL(
+            direct_play_url(
+                configuration=self._configuration(),
+                part_key='/library/parts/1/file.mkv',
+                identifier='session-id',
+            )
+        )
+
+        self.assertEqual(parsed.path, '/library/parts/1/file.mkv')
+        self.assertEqual(parsed.query['X-Plex-Token'], 'secret')
+        self.assertEqual(
+            parsed.query['X-Plex-Client-Identifier'],
+            'plexio-session-id',
+        )
+        self.assertEqual(parsed.query['X-Plex-Product'], 'Plexio')
+
+    async def test_keepalive_redirects_player_to_plex_without_proxying_media(self):
+        client = KeepaliveClient()
+        with (
+            patch('plexio.plex.playback.PING_INTERVAL', 0.01),
+            patch('plexio.plex.playback.KEEPALIVE_GRACE', 0),
+        ):
+            response = start_keepalive(
+                client=client,
+                configuration=self._configuration(),
+                rating_key='42',
+                duration_ms=0,
+                part_key='/library/parts/1/file.mkv',
+                identifier='session-id',
+            )
+            await asyncio.sleep(0.05)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            URL(response.headers['location']).query['X-Plex-Client-Identifier'],
+            'plexio-session-id',
+        )
+        self.assertEqual(
+            [url for _, url, _ in client.calls if '/library/parts/' in str(url)],
+            [],
+        )
+        self.assertEqual(client.timeline_states(), ['playing', 'stopped'])
+
+    @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
+    async def test_keepalive_reports_playing_until_plex_drops_the_session(self):
+        client = KeepaliveClient(
+            [sessions_payload(), sessions_payload(), sessions_payload()]
+        )
+
+        await self._run_loop(client, 60_000)
+
+        self.assertEqual(
+            client.timeline_states(),
+            ['playing', 'playing', 'playing', 'playing', 'stopped'],
+        )
+
+    @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
+    @patch('plexio.plex.playback.KEEPALIVE_GRACE', 0)
+    async def test_keepalive_keeps_reporting_when_sessions_query_fails(self):
+        client = KeepaliveClient(sessions_status=503)
+
+        await self._run_loop(client, 50)
+
+        session_queries = [
+            url for _, url, _ in client.calls if '/status/sessions' in str(url)
+        ]
+        self.assertGreaterEqual(len(session_queries), 2)
+        states = client.timeline_states()
+        self.assertGreaterEqual(states.count('playing'), 2)
+        self.assertEqual(states[-1], 'stopped')
+
+    @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
+    @patch('plexio.plex.playback.KEEPALIVE_GRACE', 0)
+    async def test_keepalive_stops_at_the_runtime_cap(self):
+        client = KeepaliveClient([sessions_payload()] * 50)
+
+        await self._run_loop(client, 30)
+
+        states = client.timeline_states()
+        self.assertGreaterEqual(states.count('playing'), 2)
+        self.assertEqual(states[-1], 'stopped')
