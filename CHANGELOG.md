@@ -15,6 +15,19 @@
   and ESLint 9, and retained the configure page's themes and responsive layout.
   The UI requires Safari 16.4+, Chrome 111+ or Firefox 128+.
 
+## Unreleased
+
+- Fixed playback reporting without byte proxying. “Route streams through
+  Plexio” off now keeps the timeline running instead of sending no updates
+  at all: Plexio redirects the player to a Direct Play URL that identifies
+  the session as this install and then heartbeats Plex on its own. Plex reaps
+  a session it never observes as playing, which is what ended a plain Direct
+  Play stream part-way through on servers that limit how long a session may
+  sit paused. No media crosses Plexio in this mode.
+- The keepalive ends when Plex stops listing the session, and is capped at the
+  item duration plus a grace window so a closed player cannot leave a phantom
+  session on a shared server.
+
 ## v0.10.6
 
 - Fall back to direct Plex library GUID lookup when Plex's cloud IMDb matcher

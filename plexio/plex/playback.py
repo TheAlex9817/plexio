@@ -1,11 +1,15 @@
-"""Proxy playback through Plexio and report conservative progress to Plex.
+"""Report playback progress to Plex, with or without proxying media.
 
-Active only when a configuration has report_playback enabled. The stream handler
-emits a token-free /{cfg}/play/... URL pointing here. Direct-play bytes are proxied
-from Plex with Range support, while timeline positions advance by elapsed wall time
-instead of downloaded bytes. That avoids marking rapidly buffered media as watched
-while still recording ongoing watch time for clients that consume the stream during
-playback. We do not scrobble; Plex applies its own watched threshold.
+Two modes, both active only when a configuration has report_playback enabled.
+The stream handler emits a token-free /{cfg}/play/... or /{cfg}/keepalive/... URL
+pointing here.
+
+Proxy mode sends media through Plexio with Range support. Keepalive mode
+redirects the player straight to Plex and only sends timeline updates, so no
+video crosses Plexio at all. In both, timeline positions advance by elapsed
+wall time instead of downloaded bytes. That avoids marking rapidly buffered
+media as watched while still recording ongoing watch time. We do not scrobble;
+Plex applies its own watched threshold.
 """
 
 import asyncio
@@ -14,12 +18,16 @@ import logging
 from time import monotonic
 
 import aiohttp
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
 PLEX_PRODUCT = 'Plexio'
 CHUNK = 1 << 16  # 64 KiB
 PING_INTERVAL = 10.0  # seconds between Plex timeline updates
 UPSTREAM_READ_TIMEOUT = 30.0  # seconds waiting for a requested media chunk
+KEEPALIVE_GRACE = 600.0  # extra seconds past the runtime before giving up
+
+# Background keepalives need a strong reference or the event loop may drop them.
+_KEEPALIVE_TASKS: set[asyncio.Task] = set()
 
 logger = logging.getLogger(__name__)
 
@@ -293,3 +301,155 @@ async def proxy_playback(
         headers=passthrough,
         media_type=resp.headers.get('Content-Type'),
     )
+
+
+def direct_play_url(*, configuration, part_key, identifier):
+    """Build a Plex part URL that attributes the session to this install.
+
+    Plex reaps any session it never observes as playing. Carrying the client
+    identity in the query string means the player's own request creates the
+    session, so keepalive updates land on that session instead of creating a
+    second, disconnected one.
+    """
+    return str(
+        configuration.streaming_url
+        / part_key[1:]
+        % {
+            'X-Plex-Token': configuration.access_token,
+            'X-Plex-Client-Identifier': _client_id(identifier),
+            'X-Plex-Product': PLEX_PRODUCT,
+            'X-Plex-Device-Name': PLEX_PRODUCT,
+            'X-Plex-Platform': 'Stremio',
+        }
+    )
+
+
+async def _session_alive(client, *, url, token, rating_key, identifier):
+    """Report whether Plex still lists our client session for this item.
+
+    Dropping the heartbeat is what gets a session reaped, so an unanswered
+    question must never count as "gone": any failure keeps the loop alive and
+    lets the runtime cap stop it instead.
+    """
+    sessions_url = (url / 'status/sessions').with_query({'X-Plex-Token': token})
+    try:
+        async with client.get(
+            sessions_url,
+            headers=_client_headers(identifier),
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as response:
+            if response.status >= 400:
+                return True
+            payload = await response.json(content_type=None)
+    except Exception:
+        logger.warning('Unable to read Plex sessions', exc_info=True)
+        return True
+
+    for session in (payload or {}).get('MediaContainer', {}).get('Metadata', []):
+        if str(session.get('ratingKey')) != rating_key:
+            continue
+        client_info = session.get('Client') or {}
+        if client_info.get('identifier') == _client_id(identifier):
+            return True
+    return False
+
+
+async def _keepalive_loop(
+    client,
+    *,
+    url,
+    token,
+    rating_key,
+    duration_ms,
+    identifier,
+):
+    """Hold a Plex session open as playing without touching media bytes.
+
+    The player was redirected straight to Plex, so this only sends timeline
+    updates. It ends when Plex no longer lists the session, or once the
+    runtime is well past the item duration so a closed player cannot leave a
+    phantom session behind on a shared server.
+    """
+    started_at = monotonic()
+    deadline = started_at + max(duration_ms, 0) / 1000 + KEEPALIVE_GRACE
+
+    def position(now):
+        return _position_ms(
+            total=None,
+            start=0,
+            duration_ms=duration_ms,
+            started_at=started_at,
+            now=now,
+        )
+
+    now = started_at
+    while True:
+        await _timeline(
+            client,
+            url=url,
+            token=token,
+            rating_key=rating_key,
+            state='playing',
+            time_ms=position(now),
+            duration_ms=duration_ms,
+            identifier=identifier,
+        )
+        await asyncio.sleep(PING_INTERVAL)
+        now = monotonic()
+        if now >= deadline:
+            break
+        if not await _session_alive(
+            client,
+            url=url,
+            token=token,
+            rating_key=rating_key,
+            identifier=identifier,
+        ):
+            break
+
+    await _timeline(
+        client,
+        url=url,
+        token=token,
+        rating_key=rating_key,
+        state='stopped',
+        time_ms=position(now),
+        duration_ms=duration_ms,
+        identifier=identifier,
+    )
+
+
+def start_keepalive(
+    *,
+    client,
+    configuration,
+    rating_key,
+    duration_ms,
+    part_key,
+    identifier,
+):
+    """Redirect the player to Plex and keep its session marked as playing.
+
+    No media crosses Plexio. Only the background timeline task does work, so
+    this is the mode for a self-hosted Plexio sitting away from the server.
+    """
+    target = direct_play_url(
+        configuration=configuration,
+        part_key=part_key,
+        identifier=identifier,
+    )
+    task = asyncio.create_task(
+        _keepalive_loop(
+            client,
+            url=configuration.discovery_url,
+            token=configuration.access_token,
+            rating_key=rating_key,
+            duration_ms=duration_ms,
+            identifier=identifier,
+        ),
+        name='plexio-playback-keepalive',
+    )
+    _KEEPALIVE_TASKS.add(task)
+    task.add_done_callback(_KEEPALIVE_TASKS.discard)
+    logger.info('Started Plex keepalive for a %d ms item', duration_ms)
+    return RedirectResponse(target, status_code=302)
