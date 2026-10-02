@@ -9,9 +9,13 @@
   a session it never observes as playing, which is what ended a plain Direct
   Play stream part-way through on servers that limit how long a session may
   sit paused. No media crosses Plexio in this mode.
-- The keepalive ends when Plex stops listing the session, and is capped at the
-  item duration plus a grace window so a closed player cannot leave a phantom
-  session on a shared server.
+- The keepalive reads Plex's own `playbackState` from each timeline reply and
+  stops after two consecutive non-progress answers, so it ends when the
+  session is actually gone. That works on servers that answer `/status/sessions`
+  with 403, which shared-server providers commonly do to avoid leaking other
+  users' sessions. A single blip during a seek is tolerated, and the runtime
+  cap still bounds the loop at the item duration plus a grace window so a
+  closed player cannot leave a phantom session on a shared server.
 
 ## v0.10.6
 

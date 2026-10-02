@@ -14,6 +14,7 @@ Plex applies its own watched threshold.
 
 import asyncio
 import base64
+import json
 import logging
 from time import monotonic
 
@@ -49,6 +50,20 @@ def _client_headers(identifier: str) -> dict[str, str]:
     }
 
 
+def _playback_state(body: bytes) -> str | None:
+    """Read the playbackState Plex reports for a timeline update.
+
+    Plex answers 'progress' while it still tracks the session and 'ignore'
+    once it has dropped it. On servers that block /status/sessions this is the
+    only signal that says whether the keepalive is still holding a live
+    session, so it has to be read from every update rather than discarded.
+    """
+    try:
+        return json.loads(body)['MediaContainer'].get('playbackState')
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 async def _timeline(
     client,
     *,
@@ -59,7 +74,12 @@ async def _timeline(
     time_ms,
     duration_ms,
     identifier,
-):
+) -> str | None:
+    """Send one timeline update and return the playbackState Plex reported.
+
+    Returns None when the update could not be read at all, which callers must
+    treat as "unknown" rather than "finished".
+    """
     timeline_url = (url / ':/timeline').with_query(
         {
             'ratingKey': rating_key,
@@ -76,18 +96,18 @@ async def _timeline(
             headers=_client_headers(identifier),
             timeout=aiohttp.ClientTimeout(total=5),
         ) as response:
-            await response.read()
+            body = await response.read()
             if response.status >= 400:
                 logger.warning(
                     'Plex timeline update failed with HTTP %s',
                     response.status,
                 )
-                return False
-        return True
+                return None
+        return _playback_state(body)
     except Exception:
         # Timeline reporting is optional and must never interrupt playback.
         logger.warning('Unable to send Plex timeline update', exc_info=True)
-        return False
+        return None
 
 
 async def _playback_heartbeat(
@@ -324,36 +344,6 @@ def direct_play_url(*, configuration, part_key, identifier):
     )
 
 
-async def _session_alive(client, *, url, token, rating_key, identifier):
-    """Report whether Plex still lists our client session for this item.
-
-    Dropping the heartbeat is what gets a session reaped, so an unanswered
-    question must never count as "gone": any failure keeps the loop alive and
-    lets the runtime cap stop it instead.
-    """
-    sessions_url = (url / 'status/sessions').with_query({'X-Plex-Token': token})
-    try:
-        async with client.get(
-            sessions_url,
-            headers=_client_headers(identifier),
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as response:
-            if response.status >= 400:
-                return True
-            payload = await response.json(content_type=None)
-    except Exception:
-        logger.warning('Unable to read Plex sessions', exc_info=True)
-        return True
-
-    for session in (payload or {}).get('MediaContainer', {}).get('Metadata', []):
-        if str(session.get('ratingKey')) != rating_key:
-            continue
-        client_info = session.get('Client') or {}
-        if client_info.get('identifier') == _client_id(identifier):
-            return True
-    return False
-
-
 async def _keepalive_loop(
     client,
     *,
@@ -366,9 +356,12 @@ async def _keepalive_loop(
     """Hold a Plex session open as playing without touching media bytes.
 
     The player was redirected straight to Plex, so this only sends timeline
-    updates. It ends when Plex no longer lists the session, or once the
-    runtime is well past the item duration so a closed player cannot leave a
-    phantom session behind on a shared server.
+    updates. It ends once Plex stops reporting the session as in progress, or
+    when the runtime is well past the item duration so a closed player cannot
+    leave a phantom session behind on a shared server.
+
+    Two consecutive unreadable progress states are required before giving up,
+    so a single blip during a seek does not abandon a live session.
     """
     started_at = monotonic()
     deadline = started_at + max(duration_ms, 0) / 1000 + KEEPALIVE_GRACE
@@ -383,8 +376,9 @@ async def _keepalive_loop(
         )
 
     now = started_at
+    untracked = 0
     while True:
-        await _timeline(
+        playback_state = await _timeline(
             client,
             url=url,
             token=token,
@@ -394,17 +388,10 @@ async def _keepalive_loop(
             duration_ms=duration_ms,
             identifier=identifier,
         )
+        untracked = 0 if playback_state in (None, 'progress') else untracked + 1
         await asyncio.sleep(PING_INTERVAL)
         now = monotonic()
-        if now >= deadline:
-            break
-        if not await _session_alive(
-            client,
-            url=url,
-            token=token,
-            rating_key=rating_key,
-            identifier=identifier,
-        ):
+        if now >= deadline or untracked >= 2:
             break
 
     await _timeline(

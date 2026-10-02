@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
@@ -58,7 +59,7 @@ class FakeResponse:
 
     async def read(self):
         self.read_called = True
-        return b''
+        return b'{"MediaContainer": {"playbackState": "progress"}}'
 
     def close(self):
         self.closed = True
@@ -84,45 +85,43 @@ class FakeClient:
 
 
 class KeepaliveResponse(FakeResponse):
-    def __init__(self, *, payload=None, status=200):
+    """Timeline response carrying the playbackState Plex reports back."""
+
+    def __init__(self, *, playback_state='progress', status=200):
         super().__init__(status=status)
-        self.payload = payload
+        self.playback_state = playback_state
 
-    async def json(self, content_type=None):
-        return self.payload
-
-
-def sessions_payload(rating_key='42', identifier='plexio-session-id'):
-    return {
-        'MediaContainer': {
-            'Metadata': [
-                {'ratingKey': rating_key, 'Client': {'identifier': identifier}},
-            ],
-        },
-    }
+    async def read(self):
+        self.read_called = True
+        if self.playback_state is None:
+            return b'not json'
+        return json.dumps(
+            {'MediaContainer': {'playbackState': self.playback_state}}
+        ).encode()
 
 
 class KeepaliveClient:
-    """Client that answers /status/sessions from a scripted list.
+    """Client that answers timeline calls from a scripted playbackState list.
 
-    Once the script runs out the session is reported gone, so a test that
-    forgets to end the loop still terminates instead of hanging.
+    The last scripted state repeats once the script runs out, so a test that
+    forgets to end the loop still terminates on the runtime cap.
     """
 
-    def __init__(self, session_payloads=(), *, sessions_status=200):
-        self.session_payloads = list(session_payloads)
-        self.sessions_status = sessions_status
+    def __init__(self, playback_states=('progress',), *, status=200):
+        self.script = list(playback_states)
+        self.last = self.script[-1]
+        self.status = status
         self.calls = []
 
     def get(self, url, **kwargs):
         self.calls.append(('GET', url, kwargs))
-        if '/status/sessions' not in str(url):
-            return FakeResponse()
-        if self.sessions_status >= 400:
-            return KeepaliveResponse(status=self.sessions_status)
-        if self.session_payloads:
-            return KeepaliveResponse(payload=self.session_payloads.pop(0))
-        return KeepaliveResponse(payload=sessions_payload(identifier='someone-else'))
+        if self.status >= 400:
+            return KeepaliveResponse(status=self.status)
+        if len(self.script) > 1:
+            state = self.script.pop(0)
+        else:
+            state = self.last
+        return KeepaliveResponse(playback_state=state)
 
     def timeline_states(self):
         return [
@@ -208,7 +207,7 @@ class PlaybackProxyTests(IsolatedAsyncioTestCase):
             identifier='session-id',
         )
 
-        self.assertTrue(sent)
+        self.assertEqual(sent, 'progress')
         _, url, kwargs = client.calls[0]
         self.assertEqual(url.path, '/:/timeline')
         self.assertEqual(url.query['ratingKey'], '42')
@@ -462,9 +461,7 @@ class PlaybackKeepaliveTests(IsolatedAsyncioTestCase):
 
     @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
     async def test_keepalive_reports_playing_until_plex_drops_the_session(self):
-        client = KeepaliveClient(
-            [sessions_payload(), sessions_payload(), sessions_payload()]
-        )
+        client = KeepaliveClient(['progress', 'progress', 'ignore', 'ignore'])
 
         await self._run_loop(client, 60_000)
 
@@ -475,15 +472,22 @@ class PlaybackKeepaliveTests(IsolatedAsyncioTestCase):
 
     @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
     @patch('plexio.plex.playback.KEEPALIVE_GRACE', 0)
-    async def test_keepalive_keeps_reporting_when_sessions_query_fails(self):
-        client = KeepaliveClient(sessions_status=503)
+    async def test_keepalive_tolerates_a_single_blip_mid_seek(self):
+        client = KeepaliveClient(['ignore', 'progress', 'progress', 'progress'])
+
+        await self._run_loop(client, 40)
+
+        states = client.timeline_states()
+        self.assertGreaterEqual(states.count('playing'), 3)
+        self.assertEqual(states[-1], 'stopped')
+
+    @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
+    @patch('plexio.plex.playback.KEEPALIVE_GRACE', 0)
+    async def test_keepalive_keeps_reporting_when_timeline_is_unreadable(self):
+        client = KeepaliveClient(status=503)
 
         await self._run_loop(client, 50)
 
-        session_queries = [
-            url for _, url, _ in client.calls if '/status/sessions' in str(url)
-        ]
-        self.assertGreaterEqual(len(session_queries), 2)
         states = client.timeline_states()
         self.assertGreaterEqual(states.count('playing'), 2)
         self.assertEqual(states[-1], 'stopped')
@@ -491,7 +495,7 @@ class PlaybackKeepaliveTests(IsolatedAsyncioTestCase):
     @patch('plexio.plex.playback.PING_INTERVAL', 0.01)
     @patch('plexio.plex.playback.KEEPALIVE_GRACE', 0)
     async def test_keepalive_stops_at_the_runtime_cap(self):
-        client = KeepaliveClient([sessions_payload()] * 50)
+        client = KeepaliveClient(['progress'])
 
         await self._run_loop(client, 30)
 
