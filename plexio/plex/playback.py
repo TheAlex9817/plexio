@@ -25,6 +25,7 @@ PLEX_PRODUCT = 'Plexio'
 CHUNK = 1 << 16  # 64 KiB
 PING_INTERVAL = 10.0  # seconds between Plex timeline updates
 UPSTREAM_READ_TIMEOUT = 30.0  # seconds waiting for a requested media chunk
+TIMELINE_TIMEOUT = 10.0  # seconds for one timeline update against a remote server
 KEEPALIVE_GRACE = 600.0  # extra seconds past the runtime before giving up
 
 # Background keepalives need a strong reference or the event loop may drop them.
@@ -94,7 +95,7 @@ async def _timeline(
         async with client.get(
             timeline_url,
             headers=_client_headers(identifier),
-            timeout=aiohttp.ClientTimeout(total=5),
+            timeout=aiohttp.ClientTimeout(total=TIMELINE_TIMEOUT),
         ) as response:
             body = await response.read()
             if response.status >= 400:
