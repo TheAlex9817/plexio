@@ -691,11 +691,13 @@ async def get_play(
     )
 
 
-@router.get(
+@router.api_route(
     '/{session_id}/keepalive/{rating_key}/{duration}/{part_b64}',
+    methods=['GET', 'HEAD'],
 )
-@router.get(
+@router.api_route(
     '/{installation_id}/{base64_cfg}/keepalive/{rating_key}/{duration}/{part_b64}',
+    methods=['GET', 'HEAD'],
 )
 async def get_keepalive(
     http: Annotated[ClientSession, Depends(get_http_client)],

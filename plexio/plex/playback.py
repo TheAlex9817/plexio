@@ -19,6 +19,7 @@ import logging
 from time import monotonic
 
 import aiohttp
+from fastapi import HTTPException, status
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
 PLEX_PRODUCT = 'Plexio'
@@ -190,18 +191,32 @@ async def _open_playback_response(
     headers,
 ):
     upstream = stream_base / part_key[1:] % {'X-Plex-Token': access_token}
-    return await requester(
-        upstream,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(
-            total=None,
-            sock_connect=15,
-            # aiohttp's socket timer keeps running when Plexio is backpressured
-            # by a full downstream player buffer. Keep it disabled here and
-            # time only active media reads in the response iterator instead.
-            sock_read=None,
-        ),
-    )
+    try:
+        # Bound only the handshake and header phase. aiohttp's own timers
+        # cannot be used for this: `total` would also cover the streaming
+        # body and kill long playback, while `sock_read` would fire while a
+        # legitimately buffering player backpressures Plexio. A server that
+        # accepts the connection but never answers headers is a hard hang.
+        async with asyncio.timeout(UPSTREAM_READ_TIMEOUT):
+            return await requester(
+                upstream,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    sock_connect=15,
+                    # aiohttp's socket timer keeps running when Plexio is
+                    # backpressured by a full downstream player buffer. Keep it
+                    # disabled here and time only active media reads in the
+                    # response iterator instead.
+                    sock_read=None,
+                ),
+            )
+    except TimeoutError:
+        logger.warning(
+            'Plex playback produced no response headers for %.0f seconds',
+            UPSTREAM_READ_TIMEOUT,
+        )
+        raise
 
 
 async def _read_playback_chunk(resp):
@@ -234,17 +249,23 @@ async def proxy_playback(
 
     method = request.method.upper()
     requester = client.head if method == 'HEAD' else client.get
-    resp = await _open_playback_response(
-        requester=requester,
-        # Plex-discovered alternates describe routes available to playback
-        # clients, not necessarily routes available from Plexio's container.
-        # The selected streaming URL is the only upstream explicitly chosen
-        # for server-side proxying, so never leave it for a .plex.direct route.
-        stream_base=configuration.streaming_url,
-        part_key=part_key,
-        access_token=configuration.access_token,
-        headers=fwd,
-    )
+    try:
+        resp = await _open_playback_response(
+            requester=requester,
+            # Plex-discovered alternates describe routes available to playback
+            # clients, not necessarily routes available from Plexio's container.
+            # The selected streaming URL is the only upstream explicitly chosen
+            # for server-side proxying, so never leave it for a .plex.direct route.
+            stream_base=configuration.streaming_url,
+            part_key=part_key,
+            access_token=configuration.access_token,
+            headers=fwd,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail='Plex server did not start playback in time',
+        ) from exc
     total, start = _total_and_start(resp)
     passthrough = {
         h: resp.headers[h]

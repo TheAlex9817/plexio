@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from yarl import URL
 
+from fastapi import HTTPException, status
 from plexio.plex.playback import (
     _keepalive_loop,
     _position_ms,
@@ -14,6 +15,16 @@ from plexio.plex.playback import (
     proxy_playback,
     start_keepalive,
 )
+
+
+class NeverResponse:
+    """Awaited forever, like a server that never sends response headers."""
+
+    def __await__(self):
+        async def hang():
+            await asyncio.Event().wait()
+
+        return hang().__await__()
 
 
 class FakeContent:
@@ -395,6 +406,46 @@ class PlaybackProxyTests(IsolatedAsyncioTestCase):
         self.assertEqual(response.headers['content-range'], 'bytes 0-999/1000')
         self.assertTrue(upstream.closed)
         self.assertEqual([method for method, _, _ in client.calls], ['HEAD'])
+
+    async def test_stalled_handshake_returns_504_instead_of_hanging(self):
+        """Plex accepted the TCP connection but never sent response headers.
+
+        Without a bound on the handshake phase the player waits forever: the
+        per-chunk read timeout only covers a response that already started,
+        and aiohttp's own `total` timer cannot be armed because it would also
+        kill a long streaming body.
+        """
+        configuration = SimpleNamespace(
+            streaming_url=URL('https://plex.example.test'),
+            discovery_url=URL('https://plex.example.test'),
+            access_token='secret',
+        )
+        request = SimpleNamespace(method='GET', headers={})
+
+        class StalledHandshakeClient:
+            """Answers connect, never sends response headers."""
+
+            def get(self, url, **kwargs):
+                return NeverResponse()
+
+            def head(self, url, **kwargs):
+                raise AssertionError('unexpected HEAD')
+
+        with patch('plexio.plex.playback.UPSTREAM_READ_TIMEOUT', 0.01):
+            with self.assertRaises(HTTPException) as raised:
+                await proxy_playback(
+                    request,
+                    client=StalledHandshakeClient(),
+                    configuration=configuration,
+                    rating_key='42',
+                    duration_ms=60_000,
+                    part_key='/library/parts/1/file.mkv',
+                    identifier='session-id',
+                )
+
+        self.assertEqual(
+            raised.exception.status_code, status.HTTP_504_GATEWAY_TIMEOUT
+        )
 
 
 class PlaybackKeepaliveTests(IsolatedAsyncioTestCase):

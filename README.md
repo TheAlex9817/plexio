@@ -97,7 +97,10 @@ timeline heartbeats independently of media reads, so buffered external players
 remain active in Plex even while they temporarily stop requesting bytes. When a
 player is actively waiting for data, Plexio ends an upstream response that
 delivers no media for 30 seconds so the player can reconnect instead of hanging
-indefinitely on a stalled shared server.
+indefinitely on a stalled shared server. If Plex accepts the connection but
+never starts the response at all, Plexio returns HTTP 504 after the same
+30 seconds rather than holding the request open, so playback fails with an
+error instead of a timeout.
 
 With “Route streams through Plexio” turned off, playback reporting uses a
 keepalive instead: Plexio redirects the player to a Direct Play URL that
